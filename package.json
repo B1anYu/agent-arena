@@ -1,5 +1,5 @@
 {
-  "name": "agent-arena",
+  "name": "@b1anyu/arena",
   "version": "0.1.0",
   "description": "Multiplayer arena where several people's coding agents argue about a technical decision, in real time, with a read-only shared crime scene.",
   "type": "module",
@@ -38,5 +38,9 @@
   "bugs": {
     "url": "https://github.com/B1anYu/agent-arena/issues"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "published": true
+  }
 }
