@@ -137,15 +137,24 @@ function lanAddress() {
 
 const ETIQUETTE = `
 【自由混战房间规则】（进房自动生效）
-1. 盯屏：调用 \`arena listen\` 阻塞等待。它是长轮询，返回自从你上次看到的最新消息（1.5 秒防抖后成批给你）。
+
+⚠️ 最重要的一条：这是一场"待机"游戏，不是"问答"游戏。
+   \`arena listen --loop\` 会一直阻塞到有人说话或房间收官。它返回一次之后，
+   你必须立刻再跑一次 —— 房间不会因为你读完了就去通知你。
+   如果你结束了这一轮却不再 listen，你就退出了这场辩论，后面的消息全部错过。
+   所以除了下面两种情况，你的每个回合都应以 \`arena listen --loop\` 收尾：
+   a) 收到房间收官（finished），去写复盘；
+   b) 主人明确让你停止。
+
+1. 盯屏：\`arena listen --loop\`。长轮询，1.5 秒防抖后成批给你，返回最新 seq + 全场状态。
 2. 收到消息后，三选一：
-   - 沉默吃瓜（pass）：别人的话不涉及你的立场、或者队友已替你说 → 调 \`arena pass\`，然后立刻再 listen。绝不发"说得有道理"这种水贴。
-   - 直接开火（speak）：发现漏洞立刻 \`arena speak --seq <你看到的最新seq> "..."\`，200 字以内，犀利，说完马上 listen。
-   - 蓄力放大招：需要翻代码/查日志拿证据 → 先 \`arena status "正在查 xxx"\`，取证后 \`arena speak --seq ... --evidence "..." "..."\`。带证据的发言不扣精力，还能回 1 点。
-3. 被抢话：\`arena speak\` 若返回 Interrupted，说明你打字时别人插话了。读了 missed 再决定改口合并，或加 --force 原样发射。
+   - 沉默吃瓜（pass）：不涉及你的立场、或队友已替你说 → \`arena pass\`，然后 \`arena listen --loop\`。绝不发"说得有道理"这种水贴。
+   - 直接开火（speak）：发现漏洞立刻 \`arena speak --seq <最新seq> "..."\`，200 字以内，说完回到 listen。
+   - 蓄力放大招：要翻代码/查日志 → 先 \`arena status "正在查 xxx"\`，取证后 \`arena speak --seq ... --evidence "文件:行" "..."\`。带证据不扣精力，还回 1 点。
+3. 被抢话：\`arena speak\` 返回 Interrupted 说明你打字时别人插话了。读 missed 后改口合并，或加 --force 原样发射。
 4. 精力（MP）默认 8 点，纯观点扣 1，带证据不扣。耗尽后只能取证或 pass。
-5. 可以看共享的"案发现场"（只读）：\`arena scene list|read|grep|git|logs\`。
-6. 结束：房主吹哨后你会收到 finished 事件，写一份你自己的《交锋复盘》给主人。`;
+5. 共享"案发现场"（只读）：\`arena scene list|read|grep|git|logs\`。
+6. 收官：收到 finished 后，写给主人的《交锋复盘》，不再 listen。`;
 
 /**
  * The invite travels to a different machine, so it must not name a path that
@@ -178,7 +187,7 @@ function invitePrompt({ base, code, token, topic, scene, hostName, role }) {
 1. 进房（凭证会存到本机 ~/.arena，之后的命令自动读取）：
    ${runner} join --url ${base} --room ${code} --token ${token} --name "<你的名字>-Agent" --role "${role || '你的立场角色'}"
 2. 进房后立刻进入盯屏循环（长轮询，等别人说话；有消息就直接开始干）：
-   ${runner} listen
+   ${runner} listen --loop
 ${sceneLine}
 ${ETIQUETTE}
 
@@ -222,7 +231,10 @@ function formatMessage(m) {
 export async function cmdHost(flags) {
   const port = Number(flags.port || 8787);
   const host = flags.ssh ? '127.0.0.1' : flags.bind || '0.0.0.0';
-  const pageHtml = await fs.readFile(path.join(HERE, '..', 'public', 'index.html'), 'utf8');
+  const pageHtml = {
+    index: await fs.readFile(path.join(HERE, '..', 'public', 'index.html'), 'utf8').catch(() => null),
+    control: await fs.readFile(path.join(HERE, '..', 'public', 'control.html'), 'utf8').catch(() => null),
+  };
   const { server, url } = await startHub({ port, host, pageHtml });
   const shown = flags.publicUrl || (host === '127.0.0.1' ? url : `http://<this-machine-ip>:${port}`);
   print(paint ? C.green(`arena hub 已启动：${shown}`) : `arena hub 已启动：${shown}`);
@@ -254,7 +266,10 @@ async function ensureHub({ port, bind, advertise, tunnel, foreground }) {
   if (await ping()) return { base: advertise || `http://${lanAddress()}:${port}` };
 
   if (foreground) {
-    const pageHtml = await fs.readFile(path.join(HERE, '..', 'public', 'index.html'), 'utf8').catch(() => null);
+    const pageHtml = {
+      index: await fs.readFile(path.join(HERE, '..', 'public', 'index.html'), 'utf8').catch(() => null),
+      control: await fs.readFile(path.join(HERE, '..', 'public', 'control.html'), 'utf8').catch(() => null),
+    };
     const started = await startHub({ port, host: bind, pageHtml });
     let base = advertise || (bind === '0.0.0.0' ? `http://${lanAddress()}:${port}` : started.url);
     if (tunnel) base = await startTunnel(started.url, tunnel, (line) => print(paint ? C.dim(line) : line));
@@ -327,6 +342,8 @@ export async function cmdCreate(flags) {
   print(paint ? C.green(`\n房间 ${code} 已开。议题：${topic}`) : `\n房间 ${code} 已开。议题：${topic}`);
   if (scene) print(paint ? C.dim(`现场（只读）：${scene}`) : `现场（只读）：${scene}`);
   print(paint ? C.dim(`中枢：${base}    观战页：${base}/`) : `中枢：${base}`);
+  print(paint ? C.yellow(`房主控制台：${base}/r/${code}/control?host=${hostToken}`) : `控制台：${base}/r/${code}/control?host=${hostToken}`);
+  print(paint ? C.dim(`  （这个 URL 含房主令牌，别外发。随时用 arena console 重新打印）`) : '');
   print(paint ? C.dim(`你是 ${join.agentId}。房主令牌已保存在 ~/.arena/config.json（close 房间用）`) : '');
   print(paint ? C.magenta('\n──────────── 复制下面整段发给朋友 ────────────\n') : '\n---- 复制下面整段发给朋友 ----\n');
   print(invite);
@@ -440,7 +457,7 @@ export async function cmdJoin(flags, positional) {
   print('');
   print(ETIQUETTE.trim());
   print('');
-  print(paint ? C.cyan('现在运行：arena listen') : '现在运行：arena listen');
+  print(paint ? C.cyan('现在运行：arena listen --loop') : '现在运行：arena listen --loop');
 }
 
 export async function cmdListen(flags) {
@@ -476,7 +493,14 @@ export async function cmdListen(flags) {
   }
 
   if (j.timeout) {
-    print(paint ? C.dim('（冷场中… 没有人说话。可以 pass，继续等，或者主动抛个靶子。）') : '（冷场）');
+    // A bare "nothing happened" is what teaches an agent to stop listening.
+    // --loop keeps it on watch instead of making it remember to re-run.
+    if (!flags.once && flags.loop) {
+      print(paint ? C.dim(`（冷场 ${timeout}s，继续挂着等…）`) : '');
+      await new Promise((r) => setTimeout(r, 500));
+      return cmdListen({ ...flags, since: String(q.since), loop: true, once: false });
+    }
+    print(paint ? C.dim('（冷场中… 没人说话。必须继续等：arena listen --loop，否则你会错过下一轮。）') : '（冷场）');
     return;
   }
 
@@ -704,6 +728,14 @@ export async function cmdBridge(flags, positional) {
   });
 }
 
+export async function cmdConsole(flags) {
+  const entry = await recall(flags.room?.toUpperCase());
+  if (!entry) throw new Error('还没进房：先 arena create 或 arena join');
+  if (!entry.hostToken) throw new Error('你不是房主，没有控制台');
+  print(`${entry.base.replace(/\/$/, '')}/r/${entry.code}/control?host=${entry.hostToken}`);
+  print(paint ? C.dim('（含房主令牌，不要发给别人）') : '');
+}
+
 export async function cmdClose(flags) {
   const c = await clientFor(flags, { host: true });
   const r = await c.post('/finish', { agent: c.agentId, reason: flags.reason || '房主关房', conclusion: flags.conclusion || flags.text });
@@ -764,6 +796,8 @@ export const HELP = `arena — 多人 Agent 实时擂台（房主开房，朋友
 
 非回合制循环（每个参赛 Agent）
   arena listen [--since N] [--timeout 60]  阻塞等新消息；返回最新 seq 与全场状态
+  arena listen --loop                      冷场自动重挂，直到有消息或房间收官
+  arena listen --once                      超时就直接返回（不提示继续）
   arena bridge --pane t3 [--dry-run]       装了 herdr-core 时：房间消息自动敲进空闲终端唤醒你
   arena speak --seq N "..."                开火；seq 是你看到的最新序号（乐观锁）
   arena speak --seq N --evidence "..." "..."  带实证开火，不扣精力、回 1 MP
@@ -782,6 +816,7 @@ export const HELP = `arena — 多人 Agent 实时擂台（房主开房，朋友
 收官
   arena finish [--reason "..."] [--conclusion "..."] [--report battle.md]   # 房主吹哨
   arena close [--reason "..."]             房主关房（host token）
+  arena console                            打印房主控制台 URL（改规则/禁言/移人/收官）
   arena rooms                              列出中枢上的房间
   arena watch                              人类教练实时观战（终端）
   arena say "..."                          场外递纸条
@@ -805,6 +840,7 @@ export async function main(argv) {
     host: () => cmdHost(flags),
     create: () => cmdCreate(flags),
     close: () => cmdClose(flags),
+    console: () => cmdConsole(flags),
     join: () => cmdJoin(flags, positional),
     listen: () => cmdListen(flags),
     bridge: () => cmdBridge(flags, positional),

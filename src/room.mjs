@@ -10,6 +10,46 @@ export const DEBOUNCE_MS = 1500;
 export const IDLE_END_MS = 10000;
 export const INTERRUPTED_KEEP_MS = 4000;
 
+/**
+ * Room settings the host can change from the control page while the debate is
+ * running. Everything that used to be a hardcoded constant lives here so a
+ * rule change does not need a restart or a code edit.
+ */
+export const DEFAULT_SETTINGS = Object.freeze({
+  mp: DEFAULT_MP, // energy per agent
+  idleEndMs: IDLE_END_MS, // silence before the referee calls time (0 = never)
+  allowGuestFinish: false, // may a participant end the room?
+  requireEvidenceForRefund: true, // evidence refunds 1 MP only when true
+  maxMessageChars: 2000, // hard cap, protects the stream from a wall of text
+  debounceMs: DEBOUNCE_MS,
+  openObserver: true, // /state readable without a token (the spectator page)
+  tokenJoinLimit: 0, // joins allowed per invite token; 0 = unlimited
+  sceneEnabled: true, // guests may read the scene at all
+  sceneAllow: null, // optional list of path prefixes inside the scene
+  sceneDeny: [], // path prefixes to hide even if allowed
+});
+
+export function coerceSettings(input, base = DEFAULT_SETTINGS) {
+  const out = { ...base };
+  if (!input || typeof input !== 'object') return out;
+  const num = (v, lo, hi) => (Number.isFinite(Number(v)) ? Math.max(lo, Math.min(hi, Number(v))) : undefined);
+  const set = (k, v) => {
+    if (v !== undefined) out[k] = v;
+  };
+  set('mp', num(input.mp, 1, 99));
+  set('idleEndMs', num(input.idleEndMs, 0, 3_600_000));
+  set('maxMessageChars', num(input.maxMessageChars, 50, 20_000));
+  set('debounceMs', num(input.debounceMs, 0, 10_000));
+  set('tokenJoinLimit', num(input.tokenJoinLimit, 0, 1000));
+  for (const k of ['allowGuestFinish', 'requireEvidenceForRefund', 'openObserver', 'sceneEnabled']) {
+    if (typeof input[k] === 'boolean') out[k] = input[k];
+  }
+  if (Array.isArray(input.sceneAllow)) out.sceneAllow = input.sceneAllow.map(String).slice(0, 50);
+  else if (input.sceneAllow === null) out.sceneAllow = null;
+  if (Array.isArray(input.sceneDeny)) out.sceneDeny = input.sceneDeny.map(String).slice(0, 50);
+  return out;
+}
+
 const now = () => Date.now();
 const rand = (n) => Math.floor(Math.random() * n);
 
@@ -34,13 +74,12 @@ export function agentId(name) {
  * sees the whole exchange instead of four half-sentencess.
  */
 export class Room {
-  constructor({ code, topic, scene = null, mp = DEFAULT_MP, idleEndMs = IDLE_END_MS }) {
+  constructor({ code, topic, scene = null, settings = {} }) {
     this.code = code;
     this.topic = topic;
     this.scene = scene;
     this.hostAgentId = null;
-    this.mp = mp;
-    this.idleEndMs = idleEndMs;
+    this.settings = coerceSettings(settings);
     this.createdAt = now();
     this.closedAt = null;
     this.onEvent = null;
@@ -53,6 +92,46 @@ export class Room {
     this.batch = null; // {fromSeq, toSeq, timer}
     this.conclusion = null;
     this._waiters = new Set();
+    this.jobs = new Map(); // agentId -> {disabled, note} host-controlled
+    this.joinCounts = new Map(); // invite token -> joins so far
+  }
+
+  /** Host-side control. Returns what changed, for the audit trail. */
+  updateSettings(patch) {
+    const before = { ...this.settings };
+    this.settings = coerceSettings(patch, this.settings);
+    // MP ceiling shrank: clamp everyone rather than leaving them above cap.
+    for (const m of this.members.values()) {
+      if (!m.isHost) m.mp = Math.min(m.mp, this.settings.mp);
+    }
+    const changed = Object.keys(this.settings).filter((k) => JSON.stringify(before[k]) !== JSON.stringify(this.settings[k]));
+    if (changed.length) {
+      this._event('settings', `房主调整规则：${changed.join(', ')}`);
+      this._maybeFinishIdle();
+    }
+    return { changed, settings: this.settings };
+  }
+
+  setMemberControl(id, { disabled, note }) {
+    const m = this.members.get(id);
+    if (!m) return { ok: false, error: `unknown agent ${id}` };
+    if (m.isHost) return { ok: false, error: 'cannot control the host' };
+    const job = this.jobs.get(id) || {};
+    if (typeof disabled === 'boolean') job.disabled = disabled;
+    if (typeof note === 'string') job.note = note.slice(0, 280);
+    this.jobs.set(id, job);
+    this._event('control', `${m.name}：${disabled === true ? '已禁言' : disabled === false ? '解除禁言' : ''}${note ? ' ' + job.note : ''}`.trim());
+    return { ok: true, member: { ...m, disabled: Boolean(job.disabled) } };
+  }
+
+  removeMember(id) {
+    const m = this.members.get(id);
+    if (!m) return { ok: false, error: `unknown agent ${id}` };
+    if (m.isHost) return { ok: false, error: 'cannot remove the host' };
+    m.status = 'offline';
+    m.removed = true;
+    this._event('leave', `${m.name} 被房主移出`);
+    return { ok: true };
   }
 
   _add({ name, role, owner, isHost = false, mp }) {
@@ -63,7 +142,9 @@ export class Room {
       role: role || 'guest',
       owner: owner || 'anon',
       isHost,
-      mp: mp ?? this.mp,
+      // A participant who joins after the host raised MP starts full, not
+      // stuck at the old ceiling.
+      mp: mp ?? this.settings.mp,
       status: 'idle', // idle | working | waiting | offline
       note: null,
       joinedAt: now(),
@@ -83,9 +164,27 @@ export class Room {
     return e;
   }
 
-  join({ name, role, owner, mp, isHost = false }) {
+  join({ name, role, owner, mp, isHost = false, token }) {
+    // Host-side join budget: one leaked invite promptly becoming twenty agents
+    // is what let a single person drown a room.
+    const limit = this.settings.tokenJoinLimit;
+    if (limit > 0 && token) {
+      const used = this.joinCounts.get(token) || 0;
+      if (used >= limit) return { refused: 'join_limit', limit };
+      this.joinCounts.set(token, used + 1);
+    }
     // Re-entry with the same name is allowed; ids are unique per join.
     return this._add({ name, role, owner, isHost, mp });
+  }
+
+  /** Whether a member may act at all (removed / muted). */
+  canAct(id) {
+    const m = this.members.get(id);
+    if (!m) return { ok: false, error: `unknown agent ${id}` };
+    if (m.removed) return { ok: false, removed: true, hint: '你已被房主移出房间。' };
+    const job = this.jobs.get(id);
+    if (job?.disabled) return { ok: false, muted: true, hint: '你已被房主禁言。' };
+    return { ok: true };
   }
 
   leave(id) {
@@ -138,6 +237,7 @@ export class Room {
    */
   speak({ from, text, basedOnSeq, force = false, evidence = null, kind = 'text' }) {
     const m = this.members.get(from);
+    const job = this.jobs.get(from) || {};
     if (!m) return { ok: false, error: `unknown agent ${from}` };
     if (this.closedAt) return { ok: false, error: 'room is closed' };
     const body = String(text || '').trim();
@@ -155,6 +255,14 @@ export class Room {
       };
     }
 
+    const cap = this.settings.maxMessageChars;
+    if (body.length > cap) {
+      return { ok: false, tooLong: true, limit: cap, hint: `消息 ${body.length} 字，超过上限 ${cap}。精简后重发。` };
+    }
+    if (job.disabled) {
+      return { ok: false, muted: true, hint: '你已被房主禁言。可以继续 pass 或取证，不能发言。' };
+    }
+
     // Energy: plain opinion costs 1 MP; evidence counters do not.
     const hasEvidence = Boolean(evidence && String(evidence).trim());
     if (!hasEvidence) {
@@ -166,8 +274,8 @@ export class Room {
         };
       }
       m.mp -= 1;
-    } else {
-      m.mp = Math.min(this.mp, m.mp + 1); // evidence refunds at most 1
+    } else if (this.settings.requireEvidenceForRefund) {
+      m.mp = Math.min(this.settings.mp, m.mp + 1); // evidence refunds at most 1
     }
 
     this.seq += 1;
@@ -269,16 +377,16 @@ export class Room {
 
   _scheduleBatch(msg) {
     if (!this.batch) {
-      this.batch = { fromSeq: msg.seq, toSeq: msg.seq, endsAt: now() + DEBOUNCE_MS };
+      this.batch = { fromSeq: msg.seq, toSeq: msg.seq, endsAt: now() + this.settings.debounceMs };
       setTimeout(() => {
         const b = this.batch;
         this.batch = null;
         for (const w of this._waiters) w.check();
         if (b) this._maybeFinishIdle();
-      }, DEBOUNCE_MS);
+      }, this.settings.debounceMs);
     } else {
       this.batch.toSeq = msg.seq;
-      this.batch.endsAt = now() + DEBOUNCE_MS;
+      this.batch.endsAt = now() + this.settings.debounceMs;
     }
     this._maybeFinishIdle();
   }
@@ -290,11 +398,13 @@ export class Room {
   _maybeFinishIdle() {
     if (this.closedAt) return;
     clearTimeout(this._idleTimer);
+    // 0 disables the referee entirely: the host decides when it ends.
+    if (this.settings.idleEndMs === 0) return;
     if (this.messages.length === 0) return;
     const busy = [...this.members.values()].some((m) => m.status === 'working');
     if (busy) return;
     const sinceLast = now() - (this.messages[this.messages.length - 1]?.ts || 0);
-    const wait = Math.max(0, this.idleEndMs - sinceLast);
+    const wait = Math.max(0, this.settings.idleEndMs - sinceLast);
     this._idleTimer = setTimeout(() => {
       if (this.closedAt) return;
       const stillBusy = [...this.members.values()].some((m) => m.status === 'working');
@@ -320,6 +430,7 @@ export class Room {
       scene: this.scene,
       seq: this.seq,
       closed: Boolean(this.closedAt),
+      settings: this.settings,
       members: [...this.members.values()].map((m) => ({
         id: m.id,
         name: m.name,
@@ -328,8 +439,10 @@ export class Room {
         isHost: m.isHost,
         mp: m.mp,
         status: m.status,
-        note: m.note,
+        note: this.jobs.get(m.id)?.note || m.note,
         online: m.status !== 'offline',
+        removed: Boolean(m.removed),
+        muted: Boolean(this.jobs.get(m.id)?.disabled),
       })),
     };
   }

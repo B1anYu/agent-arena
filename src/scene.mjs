@@ -44,6 +44,27 @@ export class Scene {
     return Boolean(this.root);
   }
 
+  /**
+   * Host-controlled exposure, applied before the path sandbox. `sceneAllow`
+   * is an opt-in list of path prefixes; `sceneDeny` always wins.
+   */
+  checkPolicy(settings, p) {
+    if (!settings) return { ok: true };
+    const rel = String(p || '.').replace(/^\.\//, '').replace(/^\/+/, '');
+    const deny = settings.sceneDeny || [];
+    const hitDeny = deny.find((d) => d && (rel === d.replace(/\/$/, '') || rel.startsWith(`${d.replace(/\/$/, '')}/`)));
+    if (hitDeny) return { ok: false, error: `房主隐藏了这个位置：${hitDeny}` };
+    const allow = settings.sceneAllow;
+    if (Array.isArray(allow) && allow.length) {
+      const inAllow = rel === '.' || allow.some((a) => {
+        const pre = String(a).replace(/^\.\//, '').replace(/\/$/, '');
+        return !pre || rel === pre || rel.startsWith(`${pre}/`);
+      });
+      if (!inAllow) return { ok: false, error: `房主只开放了这些位置：${allow.join(', ')}` };
+    }
+    return { ok: true };
+  }
+
   /** Resolve a caller-supplied path and refuse anything outside the root. */
   async resolve(p, { allowRoot = true } = {}) {
     if (!this.enabled) throw new Error('this room has no scene');

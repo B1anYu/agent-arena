@@ -70,15 +70,14 @@ export function createServer({ pageHtml = null } = {}) {
     }
   };
 
-  const createRoom = ({ topic, scene, name, mp, idleEndMs }) => {
+  const createRoom = ({ topic, scene, name, mp, idleEndMs, settings: s }) => {
     let code;
     do code = roomCode(); while (rooms.has(code));
     const room = new Room({
       code,
       topic: topic || '（未命名议题）',
       scene: scene ? { root: scene } : null,
-      mp,
-      idleEndMs,
+      settings: { mp, idleEndMs, ...(s || {}) },
     });
     room.sceneObj = new Scene(scene);
     room.token = crypto.randomBytes(18).toString('base64url');
@@ -116,9 +115,10 @@ export function createServer({ pageHtml = null } = {}) {
       if (p === '/health') return json(res, 200, { ok: true, rooms: rooms.size, version: '0.1.0' });
 
       if (p === '/' && req.method === 'GET') {
-        if (!pageHtml) return json(res, 200, { ok: true, hint: 'GET /r/<CODE>/state' });
+        const page = pageHtml?.index || (typeof pageHtml === 'string' ? pageHtml : null);
+        if (!page) return json(res, 200, { ok: true, hint: 'GET /r/<CODE>/state' });
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-        return res.end(pageHtml);
+        return res.end(page);
       }
 
       // Observer SSE (no token: read-only public view of a room)
@@ -140,9 +140,12 @@ export function createServer({ pageHtml = null } = {}) {
         return;
       }
 
-      // List rooms (observer)
+      // List rooms (observer). Only the room's shape, not the spectator
+      // controls — /rooms must not leak a closed room's contents.
       if (p === '/rooms' && req.method === 'GET') {
-        return json(res, 200, [...rooms.values()].map((r) => ({ ...r.state(), createdAt: r.createdAt })));
+        return json(res, 200, [...rooms.values()]
+          .filter((r) => r.settings.openObserver)
+          .map((r) => ({ ...r.state(), createdAt: r.createdAt })));
       }
 
       // Open a room. Any client that can reach the hub may do this; that is
@@ -167,8 +170,21 @@ export function createServer({ pageHtml = null } = {}) {
       const sub = m[2] || '/';
       const tok = url.searchParams.get('token') || req.headers['x-arena-token'];
 
-      // Public read-only views
+      // Host console. The page itself is static; every action it takes is
+      // host-token-gated on the server, so serving it here leaks nothing.
+      // The token arrives in the fragment-friendly `?host=` query string.
+      if (sub === '/control' && req.method === 'GET') {
+        const page = pageHtml?.control || null;
+        if (!page) return json(res, 404, { error: 'control page missing' });
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+        return res.end(page);
+      }
+
+      // Public read-only views, unless the host closed them.
       if (sub === '/state' || sub === '/') {
+        if (!room.settings.openObserver && !auth(room, req, url)) {
+          return json(res, 401, { error: '这个房间的实况仅对参与者开放' });
+        }
         const b = await (req.method === 'POST' ? body(req) : {});
         return json(res, 200, {
           ...room.state(),
@@ -187,7 +203,13 @@ export function createServer({ pageHtml = null } = {}) {
           owner: b.owner || b.ownerName || 'anon',
           isHost: Boolean(b.isHost) && !room.hostAgentId,
           mp: Number.isFinite(b.mp) ? b.mp : undefined,
+          token: tok,
         });
+        if (member.refused === 'join_limit') {
+          return json(res, 403, {
+            error: `这个邀请最多允许 ${member.limit} 个 Agent 进场，已满。找房主要新邀请。`,
+          });
+        }
         return json(res, 200, {
           agentId: member.id,
           you: member,
@@ -212,9 +234,15 @@ export function createServer({ pageHtml = null } = {}) {
         return json(res, 200, { ...out, state: room.state(), board: room.list().map((x) => ({ key: x.key, version: x.version, from: x.from })) });
       }
 
-      if (req.method === 'POST' && ['/speak', '/pass', '/status', '/idle', '/leave', '/board', '/scene', '/finish'].includes(sub)) {
+      if (req.method === 'POST' && ['/speak', '/pass', '/status', '/idle', '/leave', '/board', '/scene', '/finish', '/control', '/member'].includes(sub)) {
         if (!authed) return json(res, 401, { error: 'bad or missing token' });
         const b = await body(req);
+        // Removal and muting are enforced here, not just hidden in the UI.
+        // Host control routes are keyed by the target id, not the caller.
+        if (!['/leave', '/control', '/member'].includes(sub)) {
+          const gate = room.canAct(b.agent);
+          if (!gate.ok && sub !== '/pass') return json(res, 403, gate);
+        }
         switch (sub) {
           case '/speak': {
             const out = room.speak({
@@ -252,6 +280,11 @@ export function createServer({ pageHtml = null } = {}) {
           case '/scene': {
             const sc = room.sceneObj;
             if (!sc || !sc.enabled) return json(res, 400, { error: 'this room has no scene' });
+            if (!room.settings.sceneEnabled && !isHost(room, req, url)) {
+              return json(res, 403, { error: '房主关闭了现场取证' });
+            }
+            const gate = sc.checkPolicy(room.settings, b.path || '.');
+            if (!gate.ok) return json(res, 403, gate);
             const agentName = room.members.get(b.agent)?.name || 'agent';
             const op = b.op || 'list';
             let out;
@@ -264,9 +297,30 @@ export function createServer({ pageHtml = null } = {}) {
             room._event('scene', `${agentName} 正在现场取证：${op}`, { from: b.agent });
             return json(res, 200, out);
           }
+          case '/control': {
+            if (!isHost(room, req, url)) return json(res, 403, { error: '只有房主能改规则' });
+            const out = room.updateSettings(b.settings || {});
+            room.notify({ type: 'settings', settings: room.settings, changed: out.changed });
+            return json(res, 200, { ok: true, ...out });
+          }
+          case '/member': {
+            if (!isHost(room, req, url)) return json(res, 403, { error: '只有房主能管理选手' });
+            if (b.op === 'remove') {
+              const out = room.removeMember(b.id);
+              if (out.ok) room.notify({ type: 'members' });
+              return json(res, out.ok ? 200 : 400, out);
+            }
+            const out = room.setMemberControl(b.id, { disabled: b.disabled, note: b.note });
+            if (out.ok) room.notify({ type: 'members' });
+            return json(res, out.ok ? 200 : 400, out);
+          }
           case '/finish': {
-            if (!isHost(room, req, url) && !b.force) {
-              return json(res, 403, { error: 'only the host can call time (or pass force:true)' });
+            const host = isHost(room, req, url);
+            if (!host && !b.force && !room.settings.allowGuestFinish) {
+              return json(res, 403, { error: '只有房主能吹哨（当前设置不允许参赛者收官）' });
+            }
+            if (!host && !room.settings.allowGuestFinish && b.force) {
+              return json(res, 403, { error: '房主已关闭参赛者收官，force 不再有效' });
             }
             room.finish(b.reason || 'host called time', b.conclusion || null);
             room.notify({ type: 'finish', reason: b.reason });

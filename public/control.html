@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Arena — 房主控制台</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e;
+          --acc:#58a6ff; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --purple:#bc8cff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { padding:12px 20px; border-bottom:1px solid var(--line); display:flex; gap:14px; align-items:baseline; }
+  header h1 { font-size:14px; margin:0; letter-spacing:.1em; text-transform:uppercase; color:var(--dim); }
+  header .topic { font-size:15px; }
+  header .code { color:var(--purple); }
+  header .warn { margin-left:auto; font-size:11px; color:var(--warn); }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:0; height:calc(100vh - 46px); }
+  section { padding:16px 20px; overflow-y:auto; }
+  section + section { border-left:1px solid var(--line); }
+  h2 { font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--dim); margin:0 0 10px; }
+  .row { display:flex; align-items:center; gap:10px; padding:7px 0; border-bottom:1px solid #21262d; }
+  .row label { flex:1; }
+  .row .hint { font-size:11px; color:var(--dim); display:block; }
+  input[type=number], input[type=text] {
+    width:88px; background:var(--panel); border:1px solid var(--line); color:var(--fg);
+    padding:3px 6px; border-radius:4px; font:inherit;
+  }
+  input[type=text].wide { width:220px; }
+  input[type=checkbox] { width:15px; height:15px; accent-color:var(--acc); }
+  button { background:#21262d; border:1px solid var(--line); color:var(--fg); padding:3px 9px;
+           border-radius:4px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button.danger { color:var(--bad); }
+  button.on { background:#1f6feb33; border-color:var(--acc); color:var(--acc); }
+  .member { padding:8px 0; border-bottom:1px solid #21262d; }
+  .member .top { display:flex; align-items:center; gap:8px; }
+  .member .nm { font-weight:600; }
+  .member .meta { font-size:11px; color:var(--dim); }
+  .member .acts { margin-left:auto; display:flex; gap:6px; }
+  .tag { font-size:10px; padding:1px 5px; border-radius:3px; background:#21262d; color:var(--dim); }
+  .tag.mute { color:var(--warn); }
+  .tag.out { color:var(--bad); }
+  .log { font-size:12px; color:var(--dim); padding:3px 0; }
+  .save { position:sticky; bottom:0; background:var(--bg); padding:10px 0; border-top:1px solid var(--line); display:flex; gap:10px; align-items:center; }
+  .saved { color:var(--ok); font-size:11px; }
+  .err { color:var(--bad); }
+  .danger-zone { margin-top:24px; padding-top:14px; border-top:1px solid var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Arena 控制台</h1>
+  <span class="code" id="code">—</span>
+  <span class="topic" id="topic"></span>
+  <span class="warn">仅房主可见 · 此 URL 含 hostToken，不要外发</span>
+</header>
+<main>
+  <section>
+    <h2>规则</h2>
+    <div id="rules"></div>
+    <div class="save">
+      <button id="save" onclick="saveSettings()">应用修改</button>
+      <span id="msg"></span>
+    </div>
+    <div class="danger-zone">
+      <h2>收官</h2>
+      <div class="row">
+        <label>结论（会写进所有人的复盘）</label>
+      </div>
+      <div class="row">
+        <input type="text" class="wide" id="conclusion" placeholder="最终拍板的方案…" style="flex:1">
+      </div>
+      <div class="row">
+        <button class="danger" onclick="finishRoom()">吹哨收官</button>
+        <span id="finmsg" class="hint"></span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>选手</h2>
+    <div id="members"></div>
+    <h2 style="margin-top:22px">事件</h2>
+    <div id="events"></div>
+  </section>
+</main>
+<script>
+const code = location.pathname.split('/')[2] || '';
+const token = new URLSearchParams(location.search).get('host') || '';
+document.getElementById('code').textContent = code;
+if (!token) document.body.insertAdjacentHTML('afterbegin',
+  '<div style="padding:12px 20px;color:#f85149">缺少 hostToken。用 arena host-token 打印完整控制台地址。</div>');
+
+const num = (k, label, hint) => `<div class="row">
+  <label>${label}<span class="hint">${hint}</span></label>
+  <input type="number" id="s_${k}">
+</div>`;
+const chk = (k, label, hint) => `<div class="row">
+  <label>${label}<span class="hint">${hint}</span></label>
+  <input type="checkbox" id="s_${k}">
+</div>`;
+
+document.getElementById('rules').innerHTML = [
+  num('mp', '精力 MP', '每人初始精力。纯观点 -1，带证据不扣；房主调小会同步压低所有人'),
+  num('idleEndMs', '冷场吹哨 (ms)', '全场静默多久自动收官。0 = 不自动收官'),
+  num('maxMessageChars', '单条字数上限', '超过直接拒收，防刷屏'),
+  num('debounceMs', '防抖窗口 (ms)', '这么多毫秒内的消息合并成一批推给被唤醒的 agent'),
+  num('tokenJoinLimit', '邀请可用次数', '同一个邀请最多能进几个 agent。0 = 不限'),
+  chk('allowGuestFinish', '允许参赛者收官', '关掉之后只有房主能吹哨'),
+  chk('requireEvidenceForRefund', '证据回血', '开：带证据发言不扣的还回 1 点'),
+  chk('openObserver', '公开观战', '关：/state 和观战页需要 token 才能读'),
+  chk('sceneEnabled', '开放现场取证', '关：任何人都读不了 --scene 目录'),
+].join('');
+
+let settings = {};
+let lastEventCount = 0;
+
+async function api(path, body) {
+  const r = await fetch(`/r/${code}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-arena-token': token },
+    body: JSON.stringify(body || {}),
+  });
+  return { status: r.status, body: await r.json() };
+}
+
+function fillSettings(s) {
+  for (const k of ['mp','idleEndMs','maxMessageChars','debounceMs','tokenJoinLimit']) {
+    const el = document.getElementById('s_' + k);
+    if (el && document.activeElement !== el) el.value = s[k];
+  }
+  for (const k of ['allowGuestFinish','requireEvidenceForRefund','openObserver','sceneEnabled']) {
+    const el = document.getElementById('s_' + k);
+    if (el) el.checked = Boolean(s[k]);
+  }
+}
+
+async function saveSettings() {
+  const patch = {};
+  for (const k of ['mp','idleEndMs','maxMessageChars','debounceMs','tokenJoinLimit']) {
+    const v = Number(document.getElementById('s_' + k).value);
+    if (Number.isFinite(v)) patch[k] = v;
+  }
+  for (const k of ['allowGuestFinish','requireEvidenceForRefund','openObserver','sceneEnabled']) {
+    patch[k] = document.getElementById('s_' + k).checked;
+  }
+  const r = await api('/control', { settings: patch });
+  const m = document.getElementById('msg');
+  if (r.status === 200) {
+    m.className = 'saved';
+    m.textContent = r.body.changed.length ? '已应用：' + r.body.changed.join(', ') : '没有变化';
+    settings = r.body.settings;
+    setTimeout(() => (m.textContent = ''), 3000);
+  } else {
+    m.className = 'err';
+    m.textContent = r.body.error || '修改失败';
+  }
+}
+
+async function memberAction(id, patch) {
+  const r = await api('/member', { id, ...patch });
+  if (r.status !== 200) alert(r.body.error || '操作失败');
+  refresh();
+}
+
+async function finishRoom() {
+  const conclusion = document.getElementById('conclusion').value;
+  const r = await api('/finish', { reason: '房主吹哨', conclusion });
+  document.getElementById('finmsg').textContent = r.status === 200 ? '已收官' : (r.body.error || '失败');
+}
+
+function esc(s) { return String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function renderMembers(list) {
+  document.getElementById('members').innerHTML = list.map(m => `
+    <div class="member">
+      <div class="top">
+        <span class="nm">${esc(m.name)}</span>
+        <span class="meta">${esc(m.role)} · ${esc(m.status)} · MP ${m.mp}${m.isHost ? ' · ★房主' : ''}</span>
+        ${m.muted ? '<span class="tag mute">禁言</span>' : ''}
+        ${m.removed ? '<span class="tag out">已移出</span>' : ''}
+        <span class="acts">
+          ${m.isHost ? '' : `
+            <button onclick="memberAction('${m.id}', { disabled: ${!m.muted} })">${m.muted ? '解除禁言' : '禁言'}</button>
+            <button class="danger" onclick="if(confirm('移出 ${esc(m.name)}？')) memberAction('${m.id}', { op: 'remove' })">移出</button>`}
+        </span>
+      </div>
+      ${m.note ? `<div class="meta">${esc(m.note)}</div>` : ''}
+    </div>`).join('') || '<div class="meta">还没有人进场</div>';
+}
+
+async function refresh() {
+  if (!token) return;
+  try {
+    const r = await fetch(`/r/${code}/state`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-arena-token': token },
+      body: JSON.stringify({}),
+    }).then(x => x.json());
+    document.getElementById('topic').textContent = r.topic || '';
+    settings = r.settings || {};
+    fillSettings(settings);
+    renderMembers(r.members || []);
+    if (r.conclusion) document.getElementById('conclusion').value = r.conclusion;
+  } catch {}
+}
+
+const es = new EventSource(`/events`);
+es.onmessage = (ev) => {
+  const d = JSON.parse(ev.data);
+  if (d.hello || d.room !== code) return;
+  if (d.type === 'members' || d.type === 'settings') refresh();
+  if (d.type === 'event' || d.code) {
+    const el = document.getElementById('events');
+    const line = document.createElement('div');
+    line.className = 'log';
+    line.textContent = d.text || '';
+    el.prepend(line);
+    while (el.childNodes.length > 60) el.removeChild(el.lastChild);
+  }
+};
+setInterval(refresh, 4000);
+refresh();
+</script>
+</body>
+</html>
