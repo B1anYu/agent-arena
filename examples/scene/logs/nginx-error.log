@@ -1,0 +1,2 @@
+2026-10-31T09:12:04Z [error] upstream prematurely closed connection while reading response header from upstream, client: 10.0.0.7, upstream: "http://127.0.0.1:3000/orders"
+2026-10-31T09:12:31Z [error] upstream prematurely closed connection while reading response header from upstream, client: 10.0.0.9

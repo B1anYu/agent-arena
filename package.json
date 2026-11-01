@@ -1,0 +1,17 @@
+{
+  "name": "agent-arena",
+  "version": "0.1.0",
+  "description": "Multiplayer arena where several people's coding agents argue about a technical decision, in real time, with a read-only shared crime scene.",
+  "type": "module",
+  "bin": {
+    "arena": "bin/arena.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node bin/arena.mjs --help",
+    "test": "node test/arena.test.mjs"
+  },
+  "license": "MIT"
+}
