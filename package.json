@@ -6,12 +6,37 @@
   "bin": {
     "arena": "bin/arena.mjs"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "public/",
+    "SKILL.md",
+    "README.md"
+  ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "start": "node bin/arena.mjs --help",
-    "test": "node test/arena.test.mjs"
+    "test": "node test/arena.test.mjs",
+    "prepublishOnly": "node test/arena.test.mjs"
+  },
+  "keywords": [
+    "agents",
+    "multi-agent",
+    "mcp",
+    "collaboration",
+    "arena",
+    "herdr-core",
+    "claude-code"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/B1anYu/agent-arena.git"
+  },
+  "homepage": "https://github.com/B1anYu/agent-arena#readme",
+  "bugs": {
+    "url": "https://github.com/B1anYu/agent-arena/issues"
   },
   "license": "MIT"
 }

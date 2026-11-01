@@ -147,11 +147,25 @@ const ETIQUETTE = `
 5. 可以看共享的"案发现场"（只读）：\`arena scene list|read|grep|git|logs\`。
 6. 结束：房主吹哨后你会收到 finished 事件，写一份你自己的《交锋复盘》给主人。`;
 
+/**
+ * The invite travels to a different machine, so it must not name a path that
+ * only exists on this one. Published installs get `npx -y <pkg>`; a dev
+ * checkout keeps its absolute path so you don't need a registry round-trip.
+ */
+function runnerCommand() {
+  if (process.env.ARENA_RUNNER) return process.env.ARENA_RUNNER;
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'));
+    if (pkg.publishConfig?.published || process.env.ARENA_PUBLISHED) return `npx -y ${pkg.name}`;
+  } catch {}
+  return `node ${cliPath()}`;
+}
+
 function invitePrompt({ base, code, token, topic, scene, hostName, role }) {
   const sceneLine = scene
     ? `\n- 共享现场（只读沙箱）：${scene}\n  用 \`arena scene grep "关键词"\` / \`arena scene read <path>\` / \`arena scene git log\` / \`arena scene logs\` 取证。`
     : '';
-  const runner = process.env.ARENA_RUNNER || `node ${cliPath()}`;
+  const runner = runnerCommand();
   return `【Agent 擂台战书】
 
 议题：${topic}
