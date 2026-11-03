@@ -304,6 +304,25 @@ export async function cmdCreate(flags) {
   if (pid) print(paint ? C.dim(`中枢已在后台运行（pid ${pid}，端口 ${port}）。`) : '');
 
   const scene = flags.scene ? path.resolve(flags.scene) : null;
+  if (!scene) {
+    // Without a scene the agents can only trade opinions. That is the single
+    // biggest gap between this product and a couple of chatbots arguing, so
+    // say it at the moment the decision is made — not in the README.
+    const warn =
+      '⚠ 没有挂载现场（--scene）。\n' +
+      '  Agent 只能靠通用知识吵，--evidence「带证据不扣精力」等于没有输入源。\n' +
+      '  想让它们真刀真枪，重开一次并加上：--scene <代码或日志目录>';
+    print(paint ? C.yellow(warn) : warn);
+    print('');
+  } else {
+    // A scene that exists but holds three files makes --evidence just as
+    // hollow; the failure is quieter, so check rather than assume.
+    const thin = await sceneLooksThin(scene);
+    if (thin) {
+      print(paint ? C.yellow(`⚠ 现场很小（${thin}）。证据不够，辩论会退化成对喷。`) : `⚠ 现场很小（${thin}）`);
+      print('');
+    }
+  }
   const created = await fetch(`${base.replace(/\/$/, '')}/rooms`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -352,6 +371,24 @@ export async function cmdCreate(flags) {
   if (flags.foreground && !flags.url) {
     print(paint ? C.dim('中枢常驻于本命令（--foreground）。Ctrl+C 结束房间。') : '');
     return new Promise(() => {});
+  }
+}
+
+/**
+ * Rough evidence budget of a scene. Cheap on purpose: an agent that cannot
+ * cite a file, a log line or a diff has nothing to put in --evidence.
+ */
+async function sceneLooksThin(root) {
+  const { Scene } = await import('./scene.mjs');
+  try {
+    const { files } = await new Scene(root).list('.', { depth: 3 });
+    const real = files.filter((f) => !f.endsWith('/'));
+    if (real.length === 0) return '一个文件都没有';
+    // Two files of log/code is enough to argue over; one is not an arena.
+    if (real.length < 2) return `只有 ${real.length} 个文件`;
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -539,6 +576,61 @@ export async function cmdListen(flags) {
   print(`  arena pass`);
   print(`  arena status "正在查 xxx"   ← 要翻本地代码/现场时`);
   print(`  arena listen                ← 吃瓜，继续等`);
+}
+
+/**
+ * Non-blocking snapshot. `listen` blocks for a minute and `watch` never
+ * returns; neither is usable when a human just wants to see what happened
+ * before deciding whether to keep going.
+ */
+export async function cmdPeek(flags) {
+  const c = await clientFor(flags);
+  const entry = await recall(c.code);
+  const seen = Number(entry?.seenSeq || 0);
+  const r = await fetch(c.url('/state'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-arena-token': c.token },
+    body: JSON.stringify({}),
+  }).then((x) => x.json());
+  if (r.error) throw new Error(r.error);
+
+  const unread = [];
+  if (flags.tail) {
+    const all = await fetch(c.url('/read', { since: 0 }), { headers: { 'x-arena-token': c.token } }).then((x) => x.json());
+    unread.push(...(all.messages || []).slice(-Number(flags.tail)));
+  }
+
+  print(paint ? C.bold(`房间 ${r.code}  ${r.closed ? '【已收官】' : ''}`) : `房间 ${r.code}`);
+  print(`议题：${r.topic}`);
+  print(`进度：#${r.seq}   你已读到：#${seen}   未读：${Math.max(0, r.seq - seen)} 条`);
+  if (r.scene?.root) print(`现场：${r.scene.root}`);
+  print('');
+
+  for (const m of r.members || []) {
+    const tags = [
+      m.isHost ? '★房主' : '',
+      m.muted ? '禁言' : '',
+      m.removed ? '已移出' : '',
+      m.stale ? `失联 ${Math.round((m.lastSeenAgoMs || 0) / 60000)}m` : '',
+    ].filter(Boolean);
+    const you = m.id === c.agentId ? ' ← 你' : '';
+    print(`  ${m.name.padEnd(18)} [${m.role}] MP ${String(m.mp).padStart(2)} ${m.status}${m.note ? ' · ' + m.note : ''}${tags.length ? ' · ' + tags.join(' ') : ''}${you}`);
+  }
+  if (r.board?.length) {
+    print('');
+    print(paint ? C.dim(`黑板：${r.board.map((b) => `${b.key} v${b.version}`).join('  ')}`) : '');
+  }
+  if (unread.length) {
+    print('');
+    print(paint ? C.dim(`最后 ${unread.length} 条：`) : '');
+    for (const m of unread) print(formatMessage(m));
+  }
+  if (r.conclusion) {
+    print('');
+    print(paint ? C.yellow(`收官结论：${r.conclusion}`) : `结论：${r.conclusion}`);
+  }
+  print('');
+  print(paint ? C.dim('继续盯屏：arena listen --loop') : '');
 }
 
 export async function cmdSpeak(flags, positional) {
@@ -815,6 +907,7 @@ export const HELP = `arena — 多人 Agent 实时擂台（房主开房，朋友
   arena listen [--since N] [--timeout 60]  阻塞等新消息；返回最新 seq 与全场状态
   arena listen --loop                      冷场自动重挂，直到有消息或房间收官
   arena listen --once                      超时就直接返回（不提示继续）
+  arena peek [--tail 5]                    不阻塞看一眼：谁在、多少 MP、未读多少、最后几条
   arena bridge --pane t3 [--dry-run]       装了 herdr-core 时：房间消息自动敲进空闲终端唤醒你
   arena speak --seq N "..."                开火；seq 是你看到的最新序号（乐观锁）
   arena speak --seq N --evidence "..." "..."  带实证开火，不扣精力、回 1 MP
@@ -860,6 +953,7 @@ export async function main(argv) {
     console: () => cmdConsole(flags),
     join: () => cmdJoin(flags, positional),
     listen: () => cmdListen(flags),
+    peek: () => cmdPeek(flags),
     bridge: () => cmdBridge(flags, positional),
     speak: () => cmdSpeak(flags, positional),
     pass: () => cmdPass(flags, positional),
