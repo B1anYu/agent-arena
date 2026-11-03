@@ -16,7 +16,10 @@
   header h1 { font-size:15px; margin:0; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); font-weight:600; }
   header .topic { font-size:16px; color:var(--fg); }
   header .code { color:var(--purple); }
+  header .hub { font-size:11px; color:#484f58; }
   header .live { margin-left:auto; font-size:12px; color:var(--dim); }
+  header .dot.wait { background:var(--warn); }
+  header .dot.bad { background:var(--bad); }
   .dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--bad); margin-right:6px; }
   .dot.on { background:var(--ok); box-shadow:0 0 8px var(--ok); }
   main { display:grid; grid-template-columns:1fr 280px; gap:0; height:calc(100vh - 56px); }
@@ -57,7 +60,8 @@
 <header>
   <h1>Arena</h1>
   <span class="code" id="code">—</span>
-  <span class="topic" id="topic">还没有房间。房主先开房。</span>
+  <span class="topic" id="topic">正在连接中枢…</span>
+  <span class="hub" id="hub"></span>
   <span class="live"><span class="dot" id="dot"></span><span id="live">连接中</span></span>
 </header>
 <main>
@@ -76,21 +80,61 @@ const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&
 const rooms = new Set();
 let current = null;
 let lastSeq = 0;
-let members = {};
+// Server-sent events can be silently buffered by a proxy. We never let that
+// look like "there are no rooms" — the page knows which of these it is.
+let sseState = 'connecting';   // connecting | live | down
+let lastSseAt = Date.now();
+
+// Show where we are talking to, so a wrong address reads as a wrong address
+// instead of an empty product.
+document.getElementById('hub').textContent = location.origin;
+
+const wanted = new URLSearchParams(location.search).get('room');
 
 function show(code) {
   if (!code || current === code) return;
-  current = code;
+  current = code.toUpperCase();
   lastSeq = 0;
-  members = {};
   feed.innerHTML = '';
-  document.getElementById('code').textContent = code;
+  document.getElementById('code').textContent = current;
   document.getElementById('members').className = 'empty';
   document.getElementById('members').textContent = '—';
   document.getElementById('board').className = 'board empty';
   document.getElementById('board').textContent = '—';
   loadHistory();
   refresh();
+}
+
+function setConn(state, text) {
+  sseState = state;
+  const dot = document.getElementById('dot');
+  dot.className = 'dot' + (state === 'live' ? ' on' : state === 'down' ? ' bad' : ' wait');
+  document.getElementById('live').textContent = text;
+}
+
+/** Pull the room list over plain HTTP. Works even when SSE is buffered away. */
+async function discover() {
+  if (current) return current;
+  try {
+    const list = await fetch('/rooms').then((r) => (r.ok ? r.json() : Promise.reject(r.status)));
+    for (const r of list) rooms.add(r.code);
+    if (wanted && !current) show(rooms.has(wanted.toUpperCase()) ? wanted : wanted);
+    if (!current && rooms.size) show([...rooms][0]);
+    if (!current) note('中枢在，但还没有开着的房间。房主需要先 arena create。');
+    return current;
+  } catch (e) {
+    note(`连不上中枢 ${location.origin}（${e}）。确认地址正确、中枢还在跑。`);
+    return null;
+  }
+}
+
+function note(text) {
+  if (document.getElementById('note')) return;
+  const d = document.createElement('div');
+  d.id = 'note';
+  d.className = 'evt';
+  d.textContent = text;
+  feed.appendChild(d);
 }
 
 async function loadHistory() {
@@ -106,14 +150,42 @@ async function loadHistory() {
 }
 
 async function refresh() {
-  if (!current) return;
+  if (!current) return discover();
   try {
     const r = await fetch(`/r/${current}/state`).then((x) => x.json());
+    if (r.error) { note(`房间 ${current}: ${r.error}`); return; }
     document.getElementById('topic').textContent = r.topic || '';
     renderMembers(r.members || []);
     renderBoard(r.board || []);
     if (r.conclusion) showConclusion(r.conclusion);
-  } catch {}
+  } catch {
+    // Reachability is the SSE handler's story; don't double-report it.
+  }
+}
+
+/**
+ * While SSE is not confirmed live, keep pulling the open room list so a
+ * buffered stream still yields a usable page. The moment SSE delivers
+ * anything, polling stops being needed but is harmless.
+ */
+async function pollFallback() {
+  if (sseState === 'live') return;
+  if (!current) await discover();
+  else {
+    // The room may have been created after our last discover().
+    const list = await fetch('/rooms').then((r) => (r.ok ? r.json() : [])).catch(() => []);
+    if (list.length && !list.some((r) => r.code === current)) {
+      current = null;
+      show(list[0].code);
+    }
+  }
+  await refresh();
+}
+
+function ago(ms) {
+  if (ms == null) return '';
+  const s = Math.round(ms / 1000);
+  return s < 60 ? `${s}s 前` : `${Math.round(s / 60)}m 前`;
 }
 
 function renderMembers(list) {
@@ -122,11 +194,16 @@ function renderMembers(list) {
   el.className = '';
   el.innerHTML = list.map((m) => {
     const cls = m.mp <= 0 ? 'out' : m.mp <= 2 ? 'low' : '';
-    const bars = '●'.repeat(Math.max(0, m.mp)) + '○'.repeat(Math.max(0, 8 - m.mp));
+    const shown = m.removed ? 0 : m.mp;
+    const bars = '●'.repeat(Math.max(0, shown)) + '○'.repeat(Math.max(0, 8 - shown));
+    // A crashed agent never calls /leave, so "idle" alone would be a lie.
+    const presence = m.removed ? '<span class="tag">已移出</span>'
+      : m.stale ? `<span class="tag mute" title="超过 ${Math.round((m.lastSeenAgoMs || 0) / 1000)}s 没有任何请求">失联 ${ago(m.lastSeenAgoMs)}</span>`
+      : m.muted ? '<span class="tag mute">禁言</span>' : '';
     return `<div class="member">
       <div>
         <div class="nm">${esc(m.name)}${m.isHost ? ' ★' : ''}</div>
-        <div class="rl">${esc(m.role)} · <span class="st ${esc(m.status)}">${esc(m.status)}</span></div>
+        <div class="rl">${esc(m.role)} · <span class="st ${esc(m.status)}">${esc(m.status)}</span> ${presence}</div>
         ${m.note ? `<div class="note">${esc(m.note)}</div>` : ''}
       </div>
       <div class="mp ${cls}" title="精力">${bars}</div>
@@ -169,15 +246,27 @@ function showConclusion(text) {
 }
 
 const es = new EventSource('/events');
-const dot = document.getElementById('dot');
-const live = document.getElementById('live');
-es.onopen = () => { dot.classList.add('on'); live.textContent = '实时'; };
-es.onerror = () => { dot.classList.remove('on'); live.textContent = '重连中…'; };
+es.onopen = () => {
+  // onopen only means the connection was accepted. A proxy can still hold the
+  // bytes, so "live" waits for the first frame — see the watchdog below.
+  setConn('connecting', '已连接，等首帧…');
+};
+es.onerror = () => {
+  setConn('down', '实时中断 · 轮询中');
+  pollFallback();
+};
 es.onmessage = (ev) => {
   const d = JSON.parse(ev.data);
+  lastSseAt = Date.now();
+  if (sseState !== 'live') {
+    setConn('live', '实时');
+    if (document.getElementById('note')) document.getElementById('note').remove();
+  }
   if (d.hello) {
     (d.rooms || []).forEach((c) => rooms.add(c));
-    if (!current && rooms.size) show([...rooms][0]);
+    if (wanted) show(wanted);
+    else if (!current && rooms.size) show([...rooms][0]);
+    if (current) refresh();
     return;
   }
   if (d.room) rooms.add(d.room);
@@ -188,7 +277,19 @@ es.onmessage = (ev) => {
   else if (d.type === 'board') refresh();
   else if (d.type === 'finish' || d.type === 'finished') { refresh(); if (d.conclusion) showConclusion(d.conclusion); }
 };
-setInterval(refresh, 3000);
+
+// Watchdog: no frame for 8s means the stream is buffered or dead even though
+// the EventSource is still "open". Fall back to polling rather than showing
+// an empty product.
+setInterval(() => {
+  if (sseState === 'live' && Date.now() - lastSseAt > 8000) {
+    setConn('down', '实时无数据 · 轮询中');
+    pollFallback();
+  }
+}, 3000);
+
+setInterval(pollFallback, 3000);
+discover();
 </script>
 </body>
 </html>

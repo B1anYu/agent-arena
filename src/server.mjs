@@ -18,6 +18,21 @@ const json = (res, code, body, extra = {}) => {
   res.end(data);
 };
 
+/**
+ * Headers that keep an SSE response un-buffered through a reverse proxy.
+ * `X-Accel-Buffering` is honoured by nginx; `no-transform` stops intermediaries
+ * from re-encoding the stream; `Connection: keep-alive` keeps the socket open.
+ */
+function sseHeaders(res) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache, no-transform',
+    connection: 'keep-alive',
+    'x-accel-buffering': 'no',
+    'access-control-allow-origin': '*',
+  });
+}
+
 async function body(req, limit = 1_000_000) {
   return new Promise((resolve, reject) => {
     let n = 0;
@@ -123,12 +138,11 @@ export function createServer({ pageHtml = null } = {}) {
 
       // Observer SSE (no token: read-only public view of a room)
       if (p === '/events' && req.method === 'GET') {
-        res.writeHead(200, {
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
-          connection: 'keep-alive',
-          'access-control-allow-origin': '*',
-        });
+        sseHeaders(res);
+        // A proxy will happily buffer a small first frame until it has more
+        // (cloudflared did exactly this). A padded comment forces the first
+        // flush out immediately, before the hello event matters.
+        res.write(`: ${' '.repeat(2048)}\n\n`);
         const send = (s) => res.write(`data: ${s}\n\n`);
         observers.add(send);
         res.write(`data: ${JSON.stringify({ hello: true, rooms: [...rooms.keys()] })}\n\n`);
@@ -337,11 +351,10 @@ export function createServer({ pageHtml = null } = {}) {
           res.end();
         };
         const send = (s) => res.write(`data: ${s}\n\n`);
-        res.writeHead(200, {
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
-          connection: 'keep-alive',
-        });
+        sseHeaders(res);
+        // Same first-flush trick as /events: the bridge can sit silent for
+        // minutes and must not be held hostage by a proxy's buffer.
+        res.write(`: ${' '.repeat(2048)}\n\n`);
         for (const msg of room.messages.filter((x) => x.seq > since)) res.write(`data: ${JSON.stringify({ type: 'message', message: msg })}\n\n`);
         if (!roomStreams.has(room.code)) roomStreams.set(room.code, new Set());
         roomStreams.get(room.code).add(send);

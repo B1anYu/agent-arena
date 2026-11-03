@@ -24,6 +24,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   debounceMs: DEBOUNCE_MS,
   openObserver: true, // /state readable without a token (the spectator page)
   tokenJoinLimit: 0, // joins allowed per invite token; 0 = unlimited
+  // How long without any request before a member is reported stale. An agent
+  // that crashes or closes its terminal never calls /leave, so silence is the
+  // only signal. Guests default to two listen windows (~2 min).
+  staleAfterMs: 150_000,
   sceneEnabled: true, // guests may read the scene at all
   sceneAllow: null, // optional list of path prefixes inside the scene
   sceneDeny: [], // path prefixes to hide even if allowed
@@ -41,6 +45,7 @@ export function coerceSettings(input, base = DEFAULT_SETTINGS) {
   set('maxMessageChars', num(input.maxMessageChars, 50, 20_000));
   set('debounceMs', num(input.debounceMs, 0, 10_000));
   set('tokenJoinLimit', num(input.tokenJoinLimit, 0, 1000));
+  set('staleAfterMs', num(input.staleAfterMs, 10_000, 3_600_000));
   for (const k of ['allowGuestFinish', 'requireEvidenceForRefund', 'openObserver', 'sceneEnabled']) {
     if (typeof input[k] === 'boolean') out[k] = input[k];
   }
@@ -423,7 +428,19 @@ export class Room {
     return this.conclusion;
   }
 
+  /**
+   * An agent that crashed never calls /leave, so `status` cannot be trusted
+   * on its own. Anything not heard from for this long is reported as stale
+   * separately from online/offline: "idle" and "silently dead" look identical
+   * otherwise, and the CLI tells users to do different things about them.
+   */
+  isStale(m, now_ms = now()) {
+    if (m.removed || m.status === 'offline') return false;
+    return now_ms - m.lastSeen > this.settings.staleAfterMs;
+  }
+
   state() {
+    const t = now();
     return {
       code: this.code,
       topic: this.topic,
@@ -441,6 +458,8 @@ export class Room {
         status: m.status,
         note: this.jobs.get(m.id)?.note || m.note,
         online: m.status !== 'offline',
+        stale: this.isStale(m, t),
+        lastSeenAgoMs: m.status === 'offline' ? null : t - m.lastSeen,
         removed: Boolean(m.removed),
         muted: Boolean(this.jobs.get(m.id)?.disabled),
       })),

@@ -494,20 +494,37 @@ export async function cmdListen(flags) {
 
   if (j.timeout) {
     // A bare "nothing happened" is what teaches an agent to stop listening.
-    // --loop keeps it on watch instead of making it remember to re-run.
+    // Name who is silent and why it might be — an idle peer and a peer that
+    // crashed look identical in the member list otherwise.
+    const peers = (j.state?.members || []).filter((m) => m.id !== c.agentId && !m.removed);
+    const siblings = peers.filter((m) => m.status !== 'offline');
+    const stale = siblings.filter((m) => m.stale);
+    if (siblings.length && stale.length === siblings.length) {
+      const names = siblings.map((m) => m.name).join('、');
+      const mins = Math.max(1, Math.round((stale[0].lastSeenAgoMs || 0) / 60000));
+      const msg =
+        `（冷场：${names} 已经 ${mins} 分钟没有任何请求，多半没在监听。）\n` +
+        `  可以 arena say "..." 递纸条，或让对方重新跑 arena listen --loop。`;
+      print(paint ? C.yellow(msg) : msg);
+    } else if (j.state?.members?.some((m) => m.status === 'working')) {
+      print(paint ? C.dim('（冷场：有人在取证，等它。继续挂：arena listen --loop）') : '（冷场，对方在忙）');
+    } else {
+      print(paint ? C.dim('（冷场：在场的人都还活着但没开口。继续挂：arena listen --loop）') : '（冷场）');
+    }
     if (!flags.once && flags.loop) {
-      print(paint ? C.dim(`（冷场 ${timeout}s，继续挂着等…）`) : '');
+      print(paint ? C.dim(`  …继续挂在 listen（本次等了 ${timeout}s）`) : '');
       await new Promise((r) => setTimeout(r, 500));
       return cmdListen({ ...flags, since: String(q.since), loop: true, once: false });
     }
-    print(paint ? C.dim('（冷场中… 没人说话。必须继续等：arena listen --loop，否则你会错过下一轮。）') : '（冷场）');
     return;
   }
 
   const msgs = (j.messages || []).filter((m) => m.from !== c.agentId);
   const maxSeq = j.seq ?? since;
   const entry = await recall(c.code);
-  await remember(c.code, { ...entry, seenSeq: Math.max(entry?.seenSeq || 0, since) });
+  // Advance to what we were just handed, not to where we started: storing
+  // `since` would replay the same batch on every subsequent listen.
+  await remember(c.code, { ...entry, seenSeq: Math.max(entry?.seenSeq || 0, maxSeq) });
 
   print(paint ? C.bold(`\n━━━ 房间里来了 ${msgs.length} 条新消息（当前 #${maxSeq}）━━━`) : `\n--- 新消息 ${msgs.length} 条（#${maxSeq}）---`);
   for (const m of msgs) print(formatMessage(m));

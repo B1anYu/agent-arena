@@ -411,6 +411,69 @@ await test('idleEndMs 0 disables the referee', async () => {
   assert.equal(st.closed, false);
 });
 
+/* ── presence + live stream ──────────────────────────────────────────── */
+
+await test('a member with no traffic for staleAfterMs is flagged stale', async () => {
+  const r = await call('/rooms', { topic: '失联', name: '房主', settings: { staleAfterMs: 10000 } });
+  const code = r.body.code;
+  const tok = r.body.token;
+  await call(`/r/${code}/join`, { name: '房主', role: '房主', isHost: true }, tok);
+  await call(`/r/${code}/join`, { name: '老王' }, tok);
+  let st = await get(`/r/${code}/state`);
+  assert.ok(st.members.every((m) => m.stale === false), 'fresh members are not stale');
+
+  // Wind the clock forward instead of sleeping 10s.
+  const room = server.rooms.get(code);
+  for (const m of room.members.values()) m.lastSeen -= 60_000;
+  st = await get(`/r/${code}/state`);
+  assert.ok(st.members.every((m) => m.stale === true), 'all members go stale');
+  assert.ok(st.members.every((m) => m.lastSeenAgoMs >= 60_000));
+});
+
+await test('calling read is a heartbeat that clears staleness', async () => {
+  const code = [...server.rooms.keys()].at(-1);
+  const st0 = await get(`/r/${code}/state`);
+  const target = st0.members.find((m) => !m.isHost);
+  const tok = [...server.rooms.values()].at(-1).token;
+  await get(`/r/${code}/read?since=0&agent=${target.id}`, tok);
+  const st1 = await get(`/r/${code}/state`);
+  const after = st1.members.find((m) => m.id === target.id);
+  assert.equal(after.stale, false, 'a heartbeat resets presence');
+});
+
+await test('SSE sends a padding frame immediately and never buffers', async () => {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 3000);
+  const r = await fetch(`${base}/events`, { signal: ctrl.signal });
+  assert.equal(r.headers.get('content-type'), 'text/event-stream; charset=utf-8');
+  assert.equal(r.headers.get('x-accel-buffering'), 'no');
+  assert.match(r.headers.get('cache-control'), /no-transform/);
+
+  const reader = r.body.getReader();
+  const { value } = await reader.read();
+  clearTimeout(t);
+  const text = new TextDecoder().decode(value);
+  assert.ok(text.startsWith(':'), 'first frame is a comment so proxies flush it');
+  assert.ok(text.length > 1024, 'padding is big enough not to be coalesced away');
+  await reader.cancel();
+});
+
+await test('room stream also flushes a first frame', async () => {
+  const r6 = await call('/rooms', { topic: 'stream', name: '房主' });
+  const code = r6.body.code;
+  const tok = r6.body.token;
+  await call(`/r/${code}/join`, { name: '房主', role: '房主', isHost: true }, tok);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 3000);
+  const res = await fetch(`${base}/r/${code}/stream?since=0&token=${tok}`, { signal: ctrl.signal });
+  assert.equal(res.headers.get('x-accel-buffering'), 'no');
+  const reader = res.body.getReader();
+  const { value } = await reader.read();
+  clearTimeout(timer);
+  assert.ok(new TextDecoder().decode(value).startsWith(':'));
+  await reader.cancel();
+});
+
 /* ── report ──────────────────────────────────────────────────────────── */
 
 server.close();
