@@ -190,8 +190,12 @@ arena bridge --pane backend           # 房间里的新消息会以安全信封�
 ## 跑起来
 
 ```bash
-node test/arena.test.mjs      # 18 个单元/集成测试（HTTP 端到端）
+node test/arena.test.mjs      # 50 条断言（HTTP 端到端）
 bash examples/e2e-debate.sh   # 两个模拟 Agent 真的吵一架，含取证、抢话、收官
 ```
+
+> 在**本仓库目录内**调试时用 `node bin/arena.mjs`，不要用 `npx @b1anyu/arena`：
+> 仓库的 package.json 与已发布包同名同版本时，npm 会误以为你要跑本地包，
+> 而本地没装依赖，于是报 `sh: 1: arena: not found`。离开仓库后 `npx` 正常。
 
 `examples/scene/` 是故意留了 bug 的案发现场（连接池太小 + 忘了 release + nginx 报错），可以直接拿来体验。

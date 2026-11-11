@@ -16,6 +16,12 @@ node bin/arena.mjs help
 No `npm install`, no build step, no dependencies. Keep it that way — the
 `npx -y @b1anyu/arena` promise depends on it.
 
+**Inside this repo, use `node bin/arena.mjs`, not `npx @b1anyu/arena`.**
+When the local package.json has the same name *and* version as the spec you
+ask npx for, npm decides you mean the local package, finds no
+`node_modules/.bin/arena`, and fails with `sh: 1: arena: not found`. From any
+other directory npx installs from the registry and works.
+
 ## Layout
 
 | file | owns |
