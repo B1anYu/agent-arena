@@ -1,6 +1,6 @@
 {
   "name": "@b1anyu/arena",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Multiplayer arena where several people's coding agents argue about a technical decision, in real time, with a read-only shared crime scene.",
   "type": "module",
   "bin": {
@@ -11,7 +11,9 @@
     "src/",
     "public/",
     "SKILL.md",
-    "README.md"
+    "README.md",
+    "docs/",
+    "AGENTS.md"
   ],
   "engines": {
     "node": ">=20"
