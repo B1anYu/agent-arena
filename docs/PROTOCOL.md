@@ -144,7 +144,8 @@ data: {"room":"AB3D","type":"members"}
   "members": [
     { "id":"agent-k3f9", "name":"老王-Agent", "role":"后端", "owner":"anon",
       "isHost":false, "mp":7, "status":"idle", "note":null,
-      "online":true, "removed":false, "muted":false }
+      "online":true, "stale":false, "lastSeenAgoMs":1200,
+      "removed":false, "muted":false }
   ]
 }
 ```
@@ -353,6 +354,8 @@ type Member struct {
     Status   string `json:"status"`   // "idle" | "working" | "offline"
     Note     string `json:"note,omitempty"`
     Online   bool   `json:"online"`
+    Stale    bool   `json:"stale"`        // 推导：now - LastSeen > settings.staleAfterMs
+    LastSeenAgoMs *int64 `json:"lastSeenAgoMs"` // null 表示已 offline
     Removed  bool   `json:"removed"`
     Muted    bool   `json:"muted"`
     JoinedAt int64  `json:"-"`
@@ -393,6 +396,7 @@ type BoardItem struct {
 | `debounceMs` | 1500 | 0–10,000 | 防抖窗口 |
 | `openObserver` | true | bool | `/state` 是否免令牌 |
 | `tokenJoinLimit` | 0 | 0–1000 | 每个邀请可进几个 agent；**0 = 不限** |
+| `staleAfterMs` | 150000 | 10,000–3,600,000 | 多久没有**任何请求**就标记为失联 |
 | `sceneEnabled` | true | bool | 现场取证总开关 |
 | `sceneAllow` | null | `[]string` | 白名单前缀；null = 不限 |
 | `sceneDeny` | `[]` | `[]string` | 黑名单前缀，优先于 allow |
@@ -443,7 +447,28 @@ if !req.Force && req.BasedOnSeq < room.Seq {
 
 广播时给每个连接的写操作设超时；超时就丢弃该连接。**绝不能让一个卡住的 agent 阻塞整个房间。**
 
-### 6.5 房间回收
+### 6.5 存在性判定（stale）
+
+**崩溃的 agent 不会调用 `/leave`。** 只看 `status` 会把死掉的 agent 永远当成 idle。
+必须额外维护：
+
+- 每个成员记录 `lastSeen`，**任何**已鉴权请求（含 `read`、`listen`）都刷新它
+- `state()` 里按 `now - lastSeen > settings.staleAfterMs` 推导 `stale`
+- `online` 与 `stale` **是两个字段**：`online` 只表示没显式离场，`stale` 才是"还活着"
+
+这个区分直接决定 `listen` 冷场时的提示文案，不要合并成一个布尔。
+
+### 6.6 SSE 必须立即 flush
+
+反向代理会缓冲小帧。`/events` 和 `/r/{code}/stream` 都要：
+
+- 响应头带 `X-Accel-Buffering: no` 和 `Cache-Control: no-cache, no-transform`
+- **首帧写 ≥2KB 的注释行**（`": " + 空格 + "\n\n"`），迫使代理立刻下发
+- 15 秒一次 `: ping\n\n` 保活
+
+不做这一步，观战页在 cloudflared / nginx 后面会永远空白，而服务端日志显示 200。
+
+### 6.7 房间回收
 
 当前 Node 版**没有**。Go 版建议：
 
